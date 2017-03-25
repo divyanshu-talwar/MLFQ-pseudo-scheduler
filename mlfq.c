@@ -1,201 +1,411 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <pthread.h>
-#include <time.h>
+#include <assert.h>
 
-int no_of_queues, no_of_processes, priority_boost_time;
-int global_clock = 0;
-int running = 0;
+#define MAX_PROCESSES 50
+#define MAX_QUEUES 20
 
-pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t main_m = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t c = PTHREAD_COND_INITIALIZER;
-pthread_cond_t main_c = PTHREAD_COND_INITIALIZER;
-pthread_cond_t running_c = PTHREAD_COND_INITIALIZER;
-
-struct process{
-	int arrival_time;
-    int total_cost;
-    int amount_done;
-    int queue_number;
-    int number;
-    int created;
-    int quantum_used;
-    int done;
+struct queuenode {
+    void *data;
+    struct queuenode *next;
 };
 
-struct queue{
-	int time_quantum;
-	// condition variable list or array
+struct queue {
+    struct queuenode *front;
+    struct queuenode *rear;
+    int size;
 };
 
-struct process processes[50];
-struct queue queues[50];
+struct queue * initqueue();
+void freequeue(struct queue *q);
+void enqueue(struct queue *q, void *data);
+void dequeue(struct queue *q);
+void * front(struct queue *q);
 
-void initialize_using_config(){
-    FILE * inp;
-    char * line = NULL;
-    size_t len = 0;
-    ssize_t read;
+typedef struct queue Queue;
 
-    inp = fopen(".config", "r");
-    
-    while ((read = getline(&line, &len, inp)) != -1) {
-        if(strcmp(line,"NUMBER_OF_QUEUES\n")==0){
-            getline(&line, &len, inp);
-            no_of_queues = atoi(line);
-            printf("no of queue : %d\n", no_of_queues);
+typedef struct {
+    pthread_t *tid;
+    int pid;
+    int t_arr;
+    int t_comp;
+    int t_elap;
+    int t_fin;
+} ProcessCtx;
+
+typedef struct {
+    ProcessCtx      *p;
+    int             timer;
+    int             q;
+    int             *start;
+    int             *end;
+    pthread_mutex_t *startlock;
+    pthread_cond_t  *startcond;
+    pthread_mutex_t *endlock;
+    pthread_cond_t  *endcond;
+} ThreadArgs;
+
+typedef struct {
+    int        nb_queues;
+    int        nb_processes;
+    int        t_boost;
+    ProcessCtx process[MAX_PROCESSES];
+    Queue      *queue[MAX_QUEUES]; 
+    int        t_slice[MAX_QUEUES];
+    int        timer;
+    int        proc_fin;    ///> number of processes finished
+    int        proc_added;  ///> index of last process arrived
+    pthread_mutex_t startlock;
+    pthread_mutex_t endlock;
+    pthread_cond_t  startcond;
+    pthread_cond_t  endcond;
+    int        *start;
+    int        *end;
+} MLFQCtx;
+
+void scheduler(MLFQCtx *m);
+
+void Pthread_mutex_lock(pthread_mutex_t *lock);
+void Pthread_mutex_unlock(pthread_mutex_t *lock);
+void Pthread_cond_wait(pthread_cond_t *restrict cond, pthread_mutex_t *restrict lock);
+void Pthread_cond_signal(pthread_cond_t *restrict cond);
+
+struct queue * initqueue()
+{
+    struct queue *q = malloc(sizeof(struct queue));
+    q->front = q->rear = NULL;
+    q->size = 0;
+    return q;
+}
+
+void freequeue(struct queue *q)
+{
+    struct queuenode *temp;
+    while ((temp = front(q))) {
+        dequeue(q);
+    }
+    free(q);
+}
+
+void enqueue(struct queue *q, void *data)
+{
+    struct queuenode *temp = malloc(sizeof(struct queuenode));
+    temp->data = data;
+    temp->next = NULL;
+    q->size++;
+    if (q->front == NULL && q->rear == NULL) {
+        q->front = q->rear = temp;
+        return;
+    }
+    q->rear->next = temp;
+    q->rear = temp;
+}
+
+void dequeue(struct queue *q)
+{
+    struct queuenode *temp = q->front;
+    if (q->front == NULL) {
+        return;
+    }
+    q->size--;
+    if (q->front == q->rear) {
+        q->front = q->rear = NULL;
+    } else {
+        q->front = q->front->next;
+    }
+    free(temp);
+}
+
+void * front(struct queue *q)
+{
+    if(q->front == NULL) {
+        return NULL;
+    }
+    return q->front->data;
+}
+
+void threadargs_init(ThreadArgs *args, ProcessCtx *curr, MLFQCtx *m)
+{
+    args->p = curr;
+    args->startlock = &m->startlock;
+    args->endlock = &m->endlock;
+    args->startcond = &m->startcond;
+    args->endcond = &m->endcond;
+    args->start = m->start;
+    args->end = m->end;
+}
+
+void * thread_routine(void *args)
+{
+    ThreadArgs *t = (ThreadArgs *) args;
+    while (t->p->t_elap < t->p->t_comp) {
+        // Wait for signal to run
+        Pthread_mutex_lock(t->startlock);
+        while (*t->start == 0)
+            Pthread_cond_wait(t->startcond, t->startlock);
+        *t->start = 0;
+        Pthread_mutex_unlock(t->startlock);
+
+        // Give signal to end
+        Pthread_mutex_lock(t->endlock);
+        *t->end = 1;
+        Pthread_cond_signal(t->endcond);
+        Pthread_mutex_unlock(t->endlock);
+    }
+    return NULL;
+}
+
+void mlfq_boost(MLFQCtx *m)
+{
+    int i;
+    for (i = 0; i < m->nb_queues; i++) {
+        if (m->queue[i]) {
+            freequeue(m->queue[i]);
         }
-        if(strcmp(line,"TIME_SLICES\n")==0){
-            int i=1;
-            for( ; i <= no_of_queues ; i++){
-                getline(&line, &len, inp);
-                int slice=atoi(line);
-                queues[i].time_quantum = slice;
-                printf("time slices : %d\n", queues[i].time_quantum);
-            }
-        }
-        if(strcmp(line,"NO_OF_PROCESSES\n")==0){
-            getline(&line, &len, inp);
-            no_of_processes = atoi(line);
-            printf("number of processes %d\n", no_of_processes);
-        }
-        if(strcmp(line,"CORRESPONDING_QUEUE_NUMBERS\n")==0){
-			int i;
-			for( i = 1 ; i <= no_of_processes ; i++){
-	        	getline(&line, &len, inp);
-				int q = atoi(line);
-        		processes[i].queue_number=q;
-        		// add corresponding condition variable here
-        	}
-        }
-        if(strcmp(line,"ARRIVAL_TIMES\n")==0){
-            int i=1;
-            for( ; i <= no_of_processes ; i++){
-                getline(&line, &len, inp);
-                int time = atoi(line);
-                processes[i].amount_done=0;
-                processes[i].arrival_time=time;
-                // processes[i].queue_number=1;
-                processes[i].number=i;
-                processes[i].quantum_used=0;
-                processes[i].done=0;
-            }
-        }
-        if(strcmp(line,"CORRESPONDING_PROCESSING_TIMES\n")==0){
-            int i=1;
-            for( ; i <= no_of_processes ; i++){
-                getline(&line, &len, inp);
-                int time=atoi(line);
-                processes[i].total_cost = time;
-                printf("corresponding time : %d\n", time);
-            }
-        }
-        if(strcmp(line,"PRIORITY_BOOST\n")==0){
-            getline(&line, &len, inp);
-            priority_boost_time = atoi(line);
-            printf("%d\n", priority_boost_time );
+        m->queue[i] = initqueue();
+    }
+    for (i = 0; i < m->nb_processes; i++) {
+        ProcessCtx *p = &m->process[i];
+        if (p->t_arr <= m->timer) {
+            enqueue(m->queue[m->nb_queues - 1], p);
+            m->proc_added = i;
         }
     }
-
-    fclose(inp);
-    if (line)
-        free(line); 
 }
 
-int processes_complete(){
-    int i=1;
-    for( ; i<=no_of_processes ; i++){
-        if(processes[i].amount_done != processes[i].total_cost)
-            return 0;
-    }
-    return 1;
-}
-
-void boost_all(){
-    int i=1;
-    for( ; i<=no_of_processes ; i++)
-        processes[i].queue_number = 1;
-}
-
-int find_proc(){
-    int i=1;
-    for( ; i<=no_of_processes ; i++)
-        if(processes[i].arrival_time == global_clock && !processes[i].created)
-            return i;
-    return -1;
-}
-
-void * mul_thread(void *vargp){
-    // printf("yes in here\n");
-    pthread_mutex_lock(&m);
-    running=1;
-    int * x= (int *)vargp;
-    printf("iteration number : %d %d %d\n", *x, global_clock, processes[*x].total_cost);
-
-    while(processes[*x].amount_done != processes[*x].total_cost){
-        // printf("reached here\n");
-        while(processes[*x].quantum_used < queues[processes[*x].queue_number].time_quantum 
-                && processes[*x].amount_done != processes[*x].total_cost){
-            
-            processes[*x].amount_done++;
-            processes[*x].quantum_used++;
-            global_clock++;
-            printf("done 1 unit of process number : %d \n", *x);
-
-            if(find_proc() != -1){
-                pthread_cond_signal(&main_c);
-                pthread_cond_wait(&running_c,&m);
-            }
+void print_mlfq(MLFQCtx *m)
+{
+    int i;
+    struct queuenode *curr;
+    ProcessCtx *p;
+    printf("TIME %d\n", m->timer);
+    printf("----------------\n");
+    for (i = m->nb_queues - 1; i >= 0; i--) {
+        curr = m->queue[i]->front;
+        printf("Q%d: ", i);
+        while (curr) {
+            if (curr == m->queue[i]->front) printf("<Front>");
+            p = (ProcessCtx *) curr->data;
+            printf("[ pid %d ]", p->pid);
+            if (curr != m->queue[i]->rear)
+                printf("-->");
+            else
+                printf("<Rear>");
+            curr = curr->next;
         }
-        if(processes[*x].amount_done == processes[*x].total_cost){
-            processes[*x].quantum_used=0;
-            running=0;
+        printf("\n");
+    }
+    printf("----------------\n\n");
+}
+
+int runnable_queue(MLFQCtx *m)
+{
+    int ret = -1;
+    int i;
+    for (i = m->nb_queues - 1; i >= 0; i--) {
+        if (m->queue[i]->size > 0) {
+            ret = i;
             break;
         }
-        
-        if(processes[*x].queue_number != no_of_queues)
-            processes[*x].queue_number++;
-
-        processes[*x].quantum_used=0;
-        running=0;
-        pthread_cond_signal(&main_c);
-        pthread_cond_wait(&c,&m);
     }
-    pthread_cond_signal(&main_c);    
-    pthread_mutex_unlock(&m);
-    // pthread_exit(0);
+    return ret;
 }
 
-int main()
+void scheduler(MLFQCtx *m)
 {
-    initialize_using_config();
-    pthread_t tid;
-    pthread_mutex_lock(&m);
-    // printf("%d\n",processes_complete());
-    while(!processes_complete()){       
-
-        int procno=find_proc();
-        // printf("%d\n",procno );
-        while(procno != -1){
-            printf("creating thread for %d\n",procno);
-            processes[procno].created=1;
-            // printf("yes executed till here\n");
-            pthread_create(&tid, NULL, mul_thread, &processes[procno].number);
-            // printf("process created\n");
-            procno=find_proc();    
+    ProcessCtx *prev = NULL, *curr;
+    int q;
+    int t_switch = 0; ///> time at which last context switch happened
+    int i;
+    while (m->proc_fin < m->nb_processes) {
+        // Boost processes to top-queue
+        if (m->timer % m->t_boost == 0) {
+            t_switch = m->timer;
+            mlfq_boost(m);
+            printf("BOOST OCCURED - ");
+            print_mlfq(m);
         }
-        if(running)
-            pthread_cond_signal(&running_c);
-        else
-            pthread_cond_signal(&c);
-        
-        pthread_cond_wait(&main_c,&m);
-        printf("Now going to next iter\n");
-        printf("Time elapsed : %d\n", global_clock);
-        
+
+        // Run process for one time unit
+        q = runnable_queue(m);
+        curr = (ProcessCtx *) front(m->queue[q]);
+        assert(curr != NULL);
+        if (curr != prev) {
+            t_switch = m->timer;
+        }
+        /*printf("time: %d, queue: %d, pid: %d, t_elap: %d\n",
+               m->timer, q, curr->pid, curr->t_elap);*/
+
+        // Resume process thread
+        if (!curr->tid) {
+            ThreadArgs *args = malloc(sizeof(ThreadArgs));
+            curr->tid = malloc(sizeof(pthread_t));
+            threadargs_init(args, curr, m);
+            int rc = pthread_create(curr->tid, NULL, thread_routine, args);
+            assert(rc == 0);
+        }
+        // Give signal to start
+        Pthread_mutex_lock(&m->startlock);
+        *m->start = 1;
+        Pthread_cond_signal(&m->startcond);
+        Pthread_mutex_unlock(&m->startlock);
+        // Wait for end signal
+        Pthread_mutex_lock(&m->endlock);
+        while (*m->end== 0)
+            Pthread_cond_wait(&m->endcond, &m->endlock);
+        *m->end = 0;
+        Pthread_mutex_unlock(&m->endlock);
+
+
+        // Increment Process timer
+        curr->t_elap += 1;
+        prev = curr;
+
+        // Increment Global Timer
+        m->timer += 1;
+
+        // Check if process is complete
+        if (curr->t_elap >= curr->t_comp) {
+            dequeue(m->queue[q]);
+            curr->t_fin = m->timer;
+            m->proc_fin++;
+            printf("PROCESS %d FINISHED - ", curr->pid);
+            print_mlfq(m);
+        } // Check if slice expired
+        else if (m->timer - t_switch >= m->t_slice[q]) {
+            t_switch = m->timer;
+            dequeue(m->queue[q]);
+            if (q - 1 >= 0) q = q - 1;
+            enqueue(m->queue[q], curr);
+            printf("PROCESS %d TIMESLICE OVER - ", curr->pid);
+            print_mlfq(m);
+        }
+
+        // Add new processes
+        for (i = m->proc_added + 1; i < m->nb_processes; i++) {
+            ProcessCtx *p = &m->process[i];
+            if (p->t_arr <= m->timer) {
+                enqueue(m->queue[m->nb_queues - 1], p);
+                m->proc_added = i;
+                printf("PROCESS %d ARRIVED - ", p->pid);
+                print_mlfq(m);
+            }
+        }
     }
-    pthread_mutex_unlock(&m);
+}
+
+void Pthread_mutex_lock(pthread_mutex_t *lock)
+{
+    int ret;
+    ret = pthread_mutex_lock(lock);
+    assert(ret == 0);
+}
+
+void Pthread_mutex_unlock(pthread_mutex_t *lock)
+{
+    int ret;
+    ret = pthread_mutex_unlock(lock);
+    assert(ret == 0);
+}
+
+void Pthread_cond_wait(pthread_cond_t *restrict cond, pthread_mutex_t *restrict lock)
+{
+    int ret;
+    ret = pthread_cond_wait(cond, lock);
+    assert(ret == 0);
+}
+
+void Pthread_cond_signal(pthread_cond_t *restrict cond)
+{
+    int ret;
+    ret = pthread_cond_signal(cond);
+    assert(ret == 0);
+}
+
+void mlfq_init(MLFQCtx *m)
+{
+    m->timer = 0;
+    m->proc_fin = 0;
+    m->proc_added = -1;
+    pthread_mutex_init(&m->startlock, NULL);
+    pthread_mutex_init(&m->endlock, NULL);
+    pthread_cond_init(&m->startcond, NULL);
+    pthread_cond_init(&m->endcond, NULL);
+    m->start = malloc(sizeof(int));
+    m->end = malloc(sizeof(int));
+    *m->start = 0;
+    *m->end = 0;
+}
+
+int process_cmp(const void *a, const void *b)
+{
+    ProcessCtx *p1 = (ProcessCtx *) a;
+    ProcessCtx *p2 = (ProcessCtx *) b;
+    if (p1->t_arr != p2->t_arr) {
+        return p1->t_arr - p2->t_arr;
+    } else {
+        return p1->pid - p2->pid;
+    }
+}
+
+int queue_cmp(const void *a, const void *b)
+{
+    int *tslice1 = (int *) a;
+    int *tslice2 = (int *) b;
+    return tslice2 - tslice1;
+}
+
+void read_config(MLFQCtx *m, FILE *config)
+{
+    int i;
+    fscanf(config, "%d", &m->nb_queues);
+    assert(m->nb_queues <= MAX_QUEUES);
+    for (i = 0; i < m->nb_queues; i++) {
+        fscanf(config, "%d", &m->t_slice[i]);
+        m->queue[i] = NULL;
+    }
+    fscanf(config, "%d", &m->t_boost);
+    fscanf(config, "%d", &m->nb_processes);
+    assert(m->nb_processes <= MAX_PROCESSES);
+    for (i = 0; i < m->nb_processes; i++) {
+        fscanf(config, "%d", &m->process[i].t_arr);
+        fscanf(config, "%d", &m->process[i].t_comp);
+        m->process[i].pid    = i + 1;
+        m->process[i].tid    = NULL;
+        m->process[i].t_elap = 0;
+        m->process[i].t_fin  = 0;
+    }
+}
+
+int main(int argc, char **argv)
+{
+    assert(argc == 2);
+    FILE *config = fopen(argv[1], "r");
+    assert(config != NULL);
+    MLFQCtx *m = malloc(sizeof(MLFQCtx));
+    mlfq_init(m);
+    read_config(m, config);
+
+    qsort(m->process, m->nb_processes, sizeof(ProcessCtx), process_cmp);
+    qsort(m->t_slice, m->nb_queues, sizeof(int), queue_cmp);
+
+    int i;
+ 
+    for (i = 0; i < m->nb_queues; i++) {
+        printf("Q%d: %d\n", i, m->t_slice[i]);
+    }
+    for (i = 0; i < m->nb_processes; i++) {
+        ProcessCtx *p = &m->process[i];
+        printf("Process %d: t_arr - %d, t_comp - %d\n", p->pid, p->t_arr, p->t_comp);
+    }
+    printf("\n");
+
+    scheduler(m);
+
+    for (i = 0; i < m->nb_processes; i++) {
+        ProcessCtx *p = &m->process[i];
+        printf("Process %d: turnaround - %d\n", p->pid, p->t_fin - p->t_arr);
+    }
     return 0;
 }
